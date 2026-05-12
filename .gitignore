@@ -6,6 +6,11 @@ __pycache__/
 *.db-shm
 *.db-wal
 
+# Local secrets and machine-specific settings.
+.env
+.env.*
+!.env.example
+
 # Local editor and OS noise.
 .DS_Store
 Thumbs.db

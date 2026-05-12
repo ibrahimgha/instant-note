@@ -27,7 +27,7 @@ Tiny Windows background note taker.
 
 ## OpenAI Titles
 
-Set `OPENAI_API_KEY` before starting the app. The default title model is `gpt-4.1-mini`; override it with `OPENAI_NOTES_MODEL` if you want.
+Create a local `.env` file next to `instant_notes.pyw` and set `OPENAI_API_KEY` there before starting the app. The default title model is `gpt-4.1-mini`; override it with `OPENAI_NOTES_MODEL` if you want.
 
 If no API key is present, the app still works and uses a local fallback title. Those rows are marked with `title_status = missing_api_key` in SQLite.
 

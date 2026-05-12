@@ -27,6 +27,7 @@ from tkinter import messagebox
 
 APP_NAME = "Instant Notes"
 APP_DIR = Path(__file__).resolve().parent
+ENV_PATH = APP_DIR / ".env"
 DB_PATH = APP_DIR / "instant-notes.db"
 CONFIG_PATH = APP_DIR / "instant-notes.json"
 
@@ -45,6 +46,31 @@ VK_F10 = 0x79
 VK_MEDIA_NEXT_TRACK = 0xB0
 VK_MEDIA_PREV_TRACK = 0xB1
 VK_MEDIA_PLAY_PAUSE = 0xB3
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+load_env_file(ENV_PATH)
+
 F9_SCAN_CODE = int(os.environ.get("INSTANT_NOTES_F9_SCAN_CODE", "67"))
 F10_SCAN_CODE = int(os.environ.get("INSTANT_NOTES_F10_SCAN_CODE", "68"))
 
