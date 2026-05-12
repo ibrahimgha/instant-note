@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 import traceback
 import urllib.error
 import urllib.request
@@ -29,6 +30,17 @@ from tkinter import messagebox
 
 APP_NAME = "Instant Notes"
 APP_USER_MODEL_ID = "ibrah.instantnotes"
+EDITOR_BACKGROUND = "#f7f7f5"
+EDITOR_FOREGROUND = "#151515"
+EDITOR_INSERT_BACKGROUND = "#111111"
+EDITOR_FONT_SIZE = 12
+EDITOR_FONT_FALLBACKS = (
+    "Cascadia Mono",
+    "Cascadia Code",
+    "Consolas",
+    "Lucida Console",
+    "Courier New",
+)
 APP_DIR = Path(__file__).resolve().parent
 ENV_PATH = APP_DIR / ".env"
 DB_PATH = APP_DIR / "instant-notes.db"
@@ -273,6 +285,15 @@ def set_windows_app_id() -> None:
         shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
     except Exception as exc:
         log_exception("Could not set Windows AppUserModelID", exc)
+
+
+def resolve_editor_font(root: tk.Misc) -> tuple[str, int]:
+    available = {name.lower(): name for name in tkfont.families(root)}
+    for candidate in EDITOR_FONT_FALLBACKS:
+        match = available.get(candidate.lower())
+        if match:
+            return match, EDITOR_FONT_SIZE
+    return "TkFixedFont", EDITOR_FONT_SIZE
 
 
 def is_empty_note(content: str) -> bool:
@@ -885,16 +906,23 @@ class NoteWindow:
         app.apply_icon(self.window)
         self.window.title(note.title or "Instant Note")
         self.window.geometry("760x520")
+        self.window.configure(bg=EDITOR_BACKGROUND)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
         self.text = tk.Text(
             self.window,
             undo=True,
             wrap="word",
+            font=app.editor_font,
+            bg=EDITOR_BACKGROUND,
+            fg=EDITOR_FOREGROUND,
+            insertbackground=EDITOR_INSERT_BACKGROUND,
+            selectbackground="#d9e8ff",
+            selectforeground=EDITOR_FOREGROUND,
             borderwidth=0,
             highlightthickness=0,
-            padx=8,
-            pady=8,
+            padx=10,
+            pady=10,
         )
         self.text.pack(fill="both", expand=True)
         self.text.insert("1.0", note.content)
@@ -1194,6 +1222,7 @@ class InstantNotesApp:
         self.root.title(APP_NAME)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.root.report_callback_exception = self.report_callback_exception
+        self.editor_font = resolve_editor_font(self.root)
         self.icon_image = self.load_icon_image()
         self.apply_icon(self.root, default=True)
 
