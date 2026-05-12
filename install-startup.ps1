@@ -8,6 +8,7 @@ if (-not (Test-Path $pythonw)) {
 }
 
 $script = Join-Path $PSScriptRoot "instant_notes.pyw"
+$icon = Join-Path $PSScriptRoot "note-icon.ico"
 $startup = [Environment]::GetFolderPath("Startup")
 $shortcutPath = Join-Path $startup "Instant Notes.lnk"
 
@@ -18,6 +19,9 @@ $shortcut.Arguments = "`"$script`""
 $shortcut.WorkingDirectory = $PSScriptRoot
 $shortcut.WindowStyle = 7
 $shortcut.Description = "F9/F10 instant local notes"
+if (Test-Path $icon) {
+    $shortcut.IconLocation = $icon
+}
 $shortcut.Save()
 
 Write-Host "Created startup shortcut: $shortcutPath"

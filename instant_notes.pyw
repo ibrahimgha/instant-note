@@ -28,6 +28,7 @@ from tkinter import messagebox
 
 
 APP_NAME = "Instant Notes"
+APP_USER_MODEL_ID = "ibrah.instantnotes"
 APP_DIR = Path(__file__).resolve().parent
 ENV_PATH = APP_DIR / ".env"
 DB_PATH = APP_DIR / "instant-notes.db"
@@ -35,6 +36,7 @@ CONFIG_PATH = APP_DIR / "instant-notes.json"
 LOG_PATH = APP_DIR / "instant-notes.log"
 RECOVERY_DIR = APP_DIR / "recovery"
 ICON_PATH = APP_DIR / "note-icon.png"
+ICON_ICO_PATH = APP_DIR / "note-icon.ico"
 
 HOTKEY_NEW_ID = 9401
 HOTKEY_LIST_ID = 9402
@@ -118,6 +120,7 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+shell32 = ctypes.windll.shell32
 
 LOW_LEVEL_KEYBOARD_PROC = ctypes.WINFUNCTYPE(
     ctypes.c_ssize_t,
@@ -154,6 +157,8 @@ kernel32.GetCurrentThreadId.restype = ctypes.c_ulong
 kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
 kernel32.CreateMutexW.restype = ctypes.c_void_p
 kernel32.GetLastError.restype = ctypes.c_ulong
+shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [ctypes.c_wchar_p]
+shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
 
 
 @dataclass(frozen=True)
@@ -261,6 +266,13 @@ def write_recovery_note(note_id: str, content: str) -> Path | None:
     except OSError as exc:
         log_exception(f"Could not write recovery note for {note_id}", exc)
         return None
+
+
+def set_windows_app_id() -> None:
+    try:
+        shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception as exc:
+        log_exception("Could not set Windows AppUserModelID", exc)
 
 
 def is_empty_note(content: str) -> bool:
@@ -1172,6 +1184,7 @@ class HotkeyThread:
 
 class InstantNotesApp:
     def __init__(self) -> None:
+        set_windows_app_id()
         self.mutex = kernel32.CreateMutexW(None, False, "Local\\InstantNotesSingleton")
         if self.mutex and kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
             raise RuntimeError("Instant Notes is already running.")
@@ -1208,13 +1221,20 @@ class InstantNotesApp:
             return None
 
     def apply_icon(self, window: tk.Tk | tk.Toplevel, default: bool = False) -> None:
-        if self.icon_image is None:
-            return
+        if ICON_ICO_PATH.exists():
+            try:
+                if default:
+                    window.iconbitmap(default=str(ICON_ICO_PATH))
+                else:
+                    window.iconbitmap(str(ICON_ICO_PATH))
+            except tk.TclError as exc:
+                log_exception(f"Could not apply ico window icon from {ICON_ICO_PATH}", exc)
 
-        try:
-            window.iconphoto(default, self.icon_image)
-        except tk.TclError as exc:
-            log_exception("Could not apply window icon", exc)
+        if self.icon_image is not None:
+            try:
+                window.iconphoto(default, self.icon_image)
+            except tk.TclError as exc:
+                log_exception("Could not apply png window icon", exc)
 
     def report_callback_exception(
         self,
