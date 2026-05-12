@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 import urllib.error
 import urllib.request
 import uuid
@@ -30,6 +31,8 @@ APP_DIR = Path(__file__).resolve().parent
 ENV_PATH = APP_DIR / ".env"
 DB_PATH = APP_DIR / "instant-notes.db"
 CONFIG_PATH = APP_DIR / "instant-notes.json"
+LOG_PATH = APP_DIR / "instant-notes.log"
+RECOVERY_DIR = APP_DIR / "recovery"
 
 HOTKEY_NEW_ID = 9401
 HOTKEY_LIST_ID = 9402
@@ -173,6 +176,14 @@ def display_date(value: str, with_time: bool = True) -> str:
     return parse_iso(value).strftime(fmt)
 
 
+def display_list_timestamp(value: str) -> str:
+    created = parse_iso(value)
+    hour = created.hour % 12 or 12
+    minute = f"{created.minute:02d}"
+    period = "AM" if created.hour < 12 else "PM"
+    return f"{created:%d/%m/%Y} {hour}:{minute} {period}"
+
+
 def collapse_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
@@ -203,6 +214,51 @@ def make_full_title(created_at: str, topic: str) -> str:
 
 def fallback_title(content: str, created_at: str) -> str:
     return make_full_title(created_at, content_topic(content))
+
+
+def note_list_name(note: NoteRecord) -> str:
+    title = trim_title(note.title)
+    if title:
+        return title
+    return trim_title(content_topic(note.content)) or "Untitled"
+
+
+def note_list_row(note: NoteRecord) -> str:
+    return f"{note_list_name(note)} {display_list_timestamp(note.created_at)}"
+
+
+def log_message(message: str) -> None:
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{now_iso()}] {message}\n")
+    except OSError:
+        pass
+
+
+def log_exception(message: str, exc: BaseException | None = None) -> None:
+    details = traceback.format_exc()
+    if details.strip() == "NoneType: None" and exc is not None:
+        details = f"{type(exc).__name__}: {exc}\n"
+    log_message(f"{message}\n{details.rstrip()}")
+
+
+def write_recovery_note(note_id: str, content: str) -> Path | None:
+    if is_empty_note(content):
+        return None
+
+    try:
+        RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+        filename = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{note_id}.txt"
+        path = RECOVERY_DIR / filename
+        path.write_text(content, encoding="utf-8")
+        return path
+    except OSError as exc:
+        log_exception(f"Could not write recovery note for {note_id}", exc)
+        return None
+
+
+def is_empty_note(content: str) -> bool:
+    return not content.strip()
 
 
 def is_word_char(char: str) -> bool:
@@ -320,6 +376,7 @@ class NoteStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
+        self.delete_empty_notes()
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)
@@ -398,7 +455,21 @@ class NoteStore:
             rows = conn.execute(
                 "SELECT * FROM notes ORDER BY created_at DESC, id DESC"
             ).fetchall()
-        return [row_to_note(row) for row in rows]
+        return [row_to_note(row) for row in rows if not is_empty_note(row["content"])]
+
+    def delete_note(self, note_id: str) -> None:
+        with self.session() as conn:
+            conn.execute("DELETE FROM sync_queue WHERE note_id = ?", (note_id,))
+            conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+
+    def delete_empty_notes(self) -> int:
+        with self.session() as conn:
+            rows = conn.execute("SELECT id, content FROM notes").fetchall()
+            empty_ids = [row["id"] for row in rows if is_empty_note(row["content"])]
+            for note_id in empty_ids:
+                conn.execute("DELETE FROM sync_queue WHERE note_id = ?", (note_id,))
+                conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+        return len(empty_ids)
 
     def save_content(self, note_id: str, content: str, closed: bool = False) -> None:
         timestamp = now_iso()
@@ -513,12 +584,18 @@ class TitleWorker:
             if note_id is None:
                 return
 
-            note = self.store.get_note(note_id)
-            if not note:
-                continue
+            try:
+                note = self.store.get_note(note_id)
+                if not note:
+                    continue
+                if is_empty_note(note.content):
+                    self.store.delete_note(note.id)
+                    continue
 
-            title, status = self.generate_title(note.content, note.created_at)
-            self.store.update_title(note.id, title, status)
+                title, status = self.generate_title(note.content, note.created_at)
+                self.store.update_title(note.id, title, status)
+            except Exception as exc:
+                log_exception(f"Title worker failed for note {note_id}", exc)
 
     def generate_title(self, content: str, created_at: str) -> tuple[str, str]:
         fallback = fallback_title(content, created_at)
@@ -596,7 +673,13 @@ class SyncWorker:
 
     def run(self) -> None:
         while not self.stop_event.is_set():
-            items = self.store.pending_sync_items()
+            try:
+                items = self.store.pending_sync_items()
+            except Exception as exc:
+                log_exception("Sync worker could not read pending items", exc)
+                self.stop_event.wait(8)
+                continue
+
             if not items:
                 self.stop_event.wait(8)
                 continue
@@ -605,6 +688,9 @@ class SyncWorker:
                 if self.stop_event.is_set():
                     return
                 try:
+                    if self.store.get_note(item["note_id"]) is None:
+                        self.store.mark_sync_done(int(item["id"]))
+                        continue
                     self.push_item(item)
                     self.store.mark_sync_done(int(item["id"]))
                 except Exception as exc:
@@ -720,30 +806,52 @@ class NoteWindow:
         self.save_after = None
         if not self.dirty or self.closed:
             return
-        self.app.store.save_content(self.note.id, self.current_content(), closed=False)
-        self.dirty = False
+        try:
+            self.app.store.save_content(self.note.id, self.current_content(), closed=False)
+            self.dirty = False
+        except Exception as exc:
+            log_exception(f"Autosave failed for note {self.note.id}", exc)
+            self.schedule_save()
 
     def save_now(self) -> str:
         if self.save_after is not None:
             self.window.after_cancel(self.save_after)
             self.save_after = None
         content = self.current_content()
-        self.app.store.save_content(self.note.id, content, closed=False)
-        self.dirty = False
+        try:
+            self.app.store.save_content(self.note.id, content, closed=False)
+            self.dirty = False
+        except Exception as exc:
+            log_exception(f"Manual save failed for note {self.note.id}", exc)
+            write_recovery_note(self.note.id, content)
         return "break"
 
     def close(self) -> None:
         if self.closed:
             return
         self.closed = True
-        if self.save_after is not None:
-            self.window.after_cancel(self.save_after)
-            self.save_after = None
-        content = self.current_content()
-        self.app.store.save_content(self.note.id, content, closed=True)
-        self.app.title_worker.enqueue(self.note.id)
-        self.app.note_closed(self.note.id)
-        self.window.destroy()
+        try:
+            if self.save_after is not None:
+                self.window.after_cancel(self.save_after)
+                self.save_after = None
+            content = self.current_content()
+            if is_empty_note(content):
+                self.app.store.delete_note(self.note.id)
+            else:
+                self.app.store.save_content(self.note.id, content, closed=True)
+                self.app.title_worker.enqueue(self.note.id)
+        except Exception as exc:
+            log_exception(f"Close failed for note {self.note.id}", exc)
+            try:
+                write_recovery_note(self.note.id, self.current_content())
+            except Exception as recovery_exc:
+                log_exception(f"Recovery after close failed for note {self.note.id}", recovery_exc)
+        finally:
+            self.app.note_closed(self.note.id)
+            try:
+                self.window.destroy()
+            except tk.TclError as exc:
+                log_exception(f"Destroy failed for note {self.note.id}", exc)
 
 
 class NoteListWindow:
@@ -797,8 +905,7 @@ class NoteListWindow:
         self.note_ids = [note.id for note in notes]
         self.listbox.delete(0, "end")
         for note in notes:
-            title = note.title or fallback_title(note.content, note.created_at)
-            self.listbox.insert("end", f"{display_date(note.created_at)}   {title}")
+            self.listbox.insert("end", note_list_row(note))
 
         if selected_id in self.note_ids:
             index = self.note_ids.index(selected_id)
@@ -874,14 +981,17 @@ class HotkeyThread:
             )
 
         def hook_proc(n_code: int, w_param: int, l_param: int) -> int:
-            if n_code == 0 and w_param in {WM_KEYDOWN, WM_SYSKEYDOWN}:
-                key = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                if matches_trigger(key, triggers["new"]):
-                    emit("new")
-                    return 1
-                if matches_trigger(key, triggers["list"]):
-                    emit("list")
-                    return 1
+            try:
+                if n_code == 0 and w_param in {WM_KEYDOWN, WM_SYSKEYDOWN}:
+                    key = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    if matches_trigger(key, triggers["new"]):
+                        emit("new")
+                        return 1
+                    if matches_trigger(key, triggers["list"]):
+                        emit("list")
+                        return 1
+            except Exception as exc:
+                log_exception("Hotkey hook callback failed", exc)
             return user32.CallNextHookEx(hook_handle, n_code, w_param, l_param)
 
         register_hotkey(HOTKEY_NEW_ID, VK_F9, "F9")
@@ -893,7 +1003,9 @@ class HotkeyThread:
             errors = register_errors + [
                 f"Could not install F9/F10 keyboard hook. Windows error: {kernel32.GetLastError()}"
             ]
-            self.events.put(("error", "\n".join(errors)))
+            error_text = "\n".join(errors)
+            log_message(error_text)
+            self.events.put(("error", error_text))
 
         self.ready.set()
 
@@ -929,6 +1041,7 @@ class InstantNotesApp:
         self.root.withdraw()
         self.root.title(APP_NAME)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
+        self.root.report_callback_exception = self.report_callback_exception
 
         self.store = NoteStore(DB_PATH)
         self.title_worker = TitleWorker(self.store)
@@ -936,23 +1049,53 @@ class InstantNotesApp:
         self.hotkeys = HotkeyThread()
         self.note_windows: dict[str, NoteWindow] = {}
         self.list_window: NoteListWindow | None = None
+        self.quitting = False
 
         self.root.after(25, self.poll_hotkeys)
+        self.root.after(1000, self.watch_hotkeys)
+
+    def report_callback_exception(
+        self,
+        exc_type: type[BaseException],
+        exc_value: BaseException,
+        exc_traceback: object,
+    ) -> None:
+        details = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        log_message(f"Tk callback failed\n{details.rstrip()}")
 
     def poll_hotkeys(self) -> None:
-        while True:
-            try:
-                kind, value = self.hotkeys.events.get_nowait()
-            except queue.Empty:
-                break
+        try:
+            while True:
+                try:
+                    kind, value = self.hotkeys.events.get_nowait()
+                except queue.Empty:
+                    break
 
-            if kind == "new":
-                self.new_note()
-            elif kind == "list":
-                self.show_note_list()
-            elif kind == "error" and value:
-                messagebox.showerror(APP_NAME, value)
-        self.root.after(25, self.poll_hotkeys)
+                try:
+                    if kind == "new":
+                        self.new_note()
+                    elif kind == "list":
+                        self.show_note_list()
+                    elif kind == "error" and value:
+                        messagebox.showerror(APP_NAME, value)
+                except Exception as exc:
+                    log_exception(f"Hotkey event {kind!r} failed", exc)
+        finally:
+            if not self.quitting:
+                self.root.after(25, self.poll_hotkeys)
+
+    def watch_hotkeys(self) -> None:
+        if self.quitting:
+            return
+
+        if not self.hotkeys.thread.is_alive():
+            log_message("Hotkey thread stopped; restarting it.")
+            try:
+                self.hotkeys = HotkeyThread()
+            except Exception as exc:
+                log_exception("Could not restart hotkey thread", exc)
+
+        self.root.after(1000, self.watch_hotkeys)
 
     def new_note(self) -> None:
         note = self.store.create_note()
@@ -983,6 +1126,7 @@ class InstantNotesApp:
         self.list_window = NoteListWindow(self)
 
     def quit(self) -> None:
+        self.quitting = True
         self.hotkeys.stop()
         self.title_worker.stop()
         self.sync_worker.stop()

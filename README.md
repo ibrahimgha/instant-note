@@ -5,6 +5,7 @@ Tiny Windows background note taker.
 - `F9`: open a blank note immediately.
 - `F10`: open the note list, sorted newest first.
 - Close a note window whenever you want. It saves locally, queues sync, then generates a title in the background.
+- Empty or whitespace-only notes are discarded instead of saved.
 - Notes live in `instant-notes.db` next to the app.
 
 ## Run
