@@ -34,6 +34,7 @@ DB_PATH = APP_DIR / "instant-notes.db"
 CONFIG_PATH = APP_DIR / "instant-notes.json"
 LOG_PATH = APP_DIR / "instant-notes.log"
 RECOVERY_DIR = APP_DIR / "recovery"
+ICON_PATH = APP_DIR / "note-icon.png"
 
 HOTKEY_NEW_ID = 9401
 HOTKEY_LIST_ID = 9402
@@ -869,6 +870,7 @@ class NoteWindow:
         self.save_after: str | None = None
 
         self.window = tk.Toplevel(app.root)
+        app.apply_icon(self.window)
         self.window.title(note.title or "Instant Note")
         self.window.geometry("760x520")
         self.window.protocol("WM_DELETE_WINDOW", self.close)
@@ -997,6 +999,7 @@ class NoteListWindow:
         self.refresh_after: str | None = None
 
         self.window = tk.Toplevel(app.root)
+        app.apply_icon(self.window)
         self.window.title("Notes")
         self.window.geometry("720x500")
         self.window.protocol("WM_DELETE_WINDOW", self.close)
@@ -1178,6 +1181,8 @@ class InstantNotesApp:
         self.root.title(APP_NAME)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.root.report_callback_exception = self.report_callback_exception
+        self.icon_image = self.load_icon_image()
+        self.apply_icon(self.root, default=True)
 
         self.store = NoteStore(DB_PATH)
         self.title_worker = TitleWorker(self.store)
@@ -1191,6 +1196,25 @@ class InstantNotesApp:
 
         self.root.after(25, self.poll_hotkeys)
         self.root.after(1000, self.watch_hotkeys)
+
+    def load_icon_image(self) -> tk.PhotoImage | None:
+        if not ICON_PATH.exists():
+            return None
+
+        try:
+            return tk.PhotoImage(file=str(ICON_PATH))
+        except tk.TclError as exc:
+            log_exception(f"Could not load icon from {ICON_PATH}", exc)
+            return None
+
+    def apply_icon(self, window: tk.Tk | tk.Toplevel, default: bool = False) -> None:
+        if self.icon_image is None:
+            return
+
+        try:
+            window.iconphoto(default, self.icon_image)
+        except tk.TclError as exc:
+            log_exception("Could not apply window icon", exc)
 
     def report_callback_exception(
         self,
