@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Local note storage. Do not commit private note contents.
+*.db
+*.db-shm
+*.db-wal
+
+# Local editor and OS noise.
+.DS_Store
+Thumbs.db
