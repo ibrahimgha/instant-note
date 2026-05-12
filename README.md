@@ -34,7 +34,18 @@ If no API key is present, the app still works and uses a local fallback title. T
 
 ## Future Online Sync
 
-Every closed note and generated title is written to `sync_queue`. When the online database exists, either consume that table or set `INSTANT_NOTES_SYNC_URL` to an HTTP endpoint and the background worker will POST queued note upserts to it.
+Every save writes the latest non-empty note state to `sync_queue`. Pending upserts for the same note collapse to the newest version before syncing.
+
+For the Raspberry Pi SSH replica, copy `instant_notes_remote_sync.py` to the Pi and add this to local `.env`:
+
+```text
+INSTANT_NOTES_SSH_TARGET=rpi
+INSTANT_NOTES_SSH_SCRIPT=/home/ibrahim/instant-notes/instant_notes_remote_sync.py
+```
+
+The Pi stores its replica at `/home/ibrahim/instant-notes/instant-notes-replica.db`.
+
+When the online database exists, either consume `sync_queue` or set `INSTANT_NOTES_SYNC_URL` to an HTTP endpoint and the background worker will POST queued note upserts to it.
 
 ## Top Row Keys
 

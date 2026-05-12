@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -81,6 +82,10 @@ OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_MODEL_ENV = "OPENAI_NOTES_MODEL"
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 SYNC_URL_ENV = "INSTANT_NOTES_SYNC_URL"
+SSH_TARGET_ENV = "INSTANT_NOTES_SSH_TARGET"
+SSH_SCRIPT_ENV = "INSTANT_NOTES_SSH_SCRIPT"
+SSH_TIMEOUT_ENV = "INSTANT_NOTES_SSH_TIMEOUT"
+SSH_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 ERROR_ALREADY_EXISTS = 183
 
@@ -374,9 +379,13 @@ def row_to_note(row: sqlite3.Row) -> NoteRecord:
 class NoteStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.sync_event: threading.Event | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
         self.delete_empty_notes()
+
+    def set_sync_event(self, sync_event: threading.Event) -> None:
+        self.sync_event = sync_event
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)
@@ -458,8 +467,20 @@ class NoteStore:
         return [row_to_note(row) for row in rows if not is_empty_note(row["content"])]
 
     def delete_note(self, note_id: str) -> None:
+        timestamp = now_iso()
         with self.session() as conn:
-            conn.execute("DELETE FROM sync_queue WHERE note_id = ?", (note_id,))
+            row = conn.execute("SELECT id FROM notes WHERE id = ?", (note_id,)).fetchone()
+            conn.execute(
+                """
+                DELETE FROM sync_queue
+                WHERE note_id = ?
+                  AND processed_at IS NULL
+                  AND action = 'upsert_note'
+                """,
+                (note_id,),
+            )
+            if row:
+                self.enqueue_delete_sync(conn, note_id, timestamp)
             conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
 
     def delete_empty_notes(self) -> int:
@@ -467,7 +488,17 @@ class NoteStore:
             rows = conn.execute("SELECT id, content FROM notes").fetchall()
             empty_ids = [row["id"] for row in rows if is_empty_note(row["content"])]
             for note_id in empty_ids:
-                conn.execute("DELETE FROM sync_queue WHERE note_id = ?", (note_id,))
+                timestamp = now_iso()
+                conn.execute(
+                    """
+                    DELETE FROM sync_queue
+                    WHERE note_id = ?
+                      AND processed_at IS NULL
+                      AND action = 'upsert_note'
+                    """,
+                    (note_id,),
+                )
+                self.enqueue_delete_sync(conn, note_id, timestamp)
                 conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
         return len(empty_ids)
 
@@ -487,12 +518,19 @@ class NoteStore:
                     """,
                     (content, timestamp, timestamp, note_id),
                 )
-                self.enqueue_sync(conn, note_id, "upsert_note", timestamp)
             else:
                 conn.execute(
-                    "UPDATE notes SET content = ?, updated_at = ? WHERE id = ?",
+                    """
+                    UPDATE notes
+                    SET content = ?,
+                        updated_at = ?,
+                        sync_status = 'pending'
+                    WHERE id = ?
+                    """,
                     (content, timestamp, note_id),
                 )
+            if not is_empty_note(content):
+                self.enqueue_sync(conn, note_id, "upsert_note", timestamp)
 
     def update_title(self, note_id: str, title: str, status: str) -> None:
         timestamp = now_iso()
@@ -529,7 +567,18 @@ class NoteStore:
             "content": row["content"],
             "title": row["title"],
             "title_status": row["title_status"],
+            "title_updated_at": row["title_updated_at"],
+            "last_closed_at": row["last_closed_at"],
         }
+        conn.execute(
+            """
+            DELETE FROM sync_queue
+            WHERE note_id = ?
+              AND action = ?
+              AND processed_at IS NULL
+            """,
+            (note_id, action),
+        )
         conn.execute(
             """
             INSERT INTO sync_queue (note_id, action, payload, created_at)
@@ -537,6 +586,47 @@ class NoteStore:
             """,
             (note_id, action, json.dumps(payload, ensure_ascii=False), timestamp),
         )
+        self.wake_sync()
+
+    def enqueue_delete_sync(
+        self,
+        conn: sqlite3.Connection,
+        note_id: str,
+        timestamp: str,
+    ) -> None:
+        payload = {
+            "id": note_id,
+            "deleted_at": timestamp,
+        }
+        conn.execute(
+            """
+            DELETE FROM sync_queue
+            WHERE note_id = ?
+              AND processed_at IS NULL
+            """,
+            (note_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO sync_queue (note_id, action, payload, created_at)
+            VALUES (?, 'delete_note', ?, ?)
+            """,
+            (note_id, json.dumps(payload, ensure_ascii=False), timestamp),
+        )
+        self.wake_sync()
+
+    def enqueue_all_notes_for_sync(self) -> int:
+        timestamp = now_iso()
+        with self.session() as conn:
+            rows = conn.execute("SELECT id, content FROM notes").fetchall()
+            note_ids = [row["id"] for row in rows if not is_empty_note(row["content"])]
+            for note_id in note_ids:
+                self.enqueue_sync(conn, note_id, "upsert_note", timestamp)
+        return len(note_ids)
+
+    def wake_sync(self) -> None:
+        if self.sync_event is not None:
+            self.sync_event.set()
 
     def pending_sync_items(self, limit: int = 20) -> list[sqlite3.Row]:
         with self.session() as conn:
@@ -552,10 +642,19 @@ class NoteStore:
 
     def mark_sync_done(self, item_id: int) -> None:
         with self.session() as conn:
+            row = conn.execute(
+                "SELECT note_id, action FROM sync_queue WHERE id = ?",
+                (item_id,),
+            ).fetchone()
             conn.execute(
                 "UPDATE sync_queue SET processed_at = ?, last_error = NULL WHERE id = ?",
                 (now_iso(), item_id),
             )
+            if row and row["action"] == "upsert_note":
+                conn.execute(
+                    "UPDATE notes SET sync_status = 'synced' WHERE id = ?",
+                    (row["note_id"],),
+                )
 
     def mark_sync_error(self, item_id: int, error: str) -> None:
         with self.session() as conn:
@@ -662,14 +761,24 @@ class SyncWorker:
     def __init__(self, store: NoteStore) -> None:
         self.store = store
         self.endpoint = os.environ.get(SYNC_URL_ENV, "").strip()
+        self.ssh_target = os.environ.get(SSH_TARGET_ENV, "").strip()
+        self.ssh_script = os.environ.get(
+            SSH_SCRIPT_ENV,
+            "~/instant-notes/instant_notes_remote_sync.py",
+        ).strip()
+        self.ssh_timeout = int(os.environ.get(SSH_TIMEOUT_ENV, "20"))
         self.stop_event = threading.Event()
+        self.wake_event = threading.Event()
+        self.store.set_sync_event(self.wake_event)
         self.thread: threading.Thread | None = None
-        if self.endpoint:
+        self.enabled = bool(self.endpoint or self.ssh_target)
+        if self.enabled:
             self.thread = threading.Thread(target=self.run, name="InstantNotesSyncWorker", daemon=True)
             self.thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.wake_event.set()
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -677,25 +786,29 @@ class SyncWorker:
                 items = self.store.pending_sync_items()
             except Exception as exc:
                 log_exception("Sync worker could not read pending items", exc)
-                self.stop_event.wait(8)
+                self.wait_for_next_sync(8)
                 continue
 
             if not items:
-                self.stop_event.wait(8)
+                self.wait_for_next_sync(8)
                 continue
 
             for item in items:
                 if self.stop_event.is_set():
                     return
                 try:
-                    if self.store.get_note(item["note_id"]) is None:
+                    if item["action"] == "upsert_note" and self.store.get_note(item["note_id"]) is None:
                         self.store.mark_sync_done(int(item["id"]))
                         continue
                     self.push_item(item)
                     self.store.mark_sync_done(int(item["id"]))
                 except Exception as exc:
                     self.store.mark_sync_error(int(item["id"]), str(exc))
-                    time.sleep(2)
+                    self.wait_for_next_sync(2)
+
+    def wait_for_next_sync(self, timeout: float) -> None:
+        self.wake_event.wait(timeout)
+        self.wake_event.clear()
 
     def push_item(self, item: sqlite3.Row) -> None:
         payload = {
@@ -705,6 +818,17 @@ class SyncWorker:
             "created_at": item["created_at"],
             "note": json.loads(item["payload"]),
         }
+        if item["action"] == "delete_note":
+            payload["id"] = item["note_id"]
+            payload["deleted_at"] = payload["note"].get("deleted_at")
+
+        if self.ssh_target:
+            self.push_ssh_item(payload)
+            return
+
+        if not self.endpoint:
+            return
+
         request = urllib.request.Request(
             self.endpoint,
             data=json.dumps(payload).encode("utf-8"),
@@ -717,6 +841,19 @@ class SyncWorker:
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"HTTP {exc.code}: {body[:300]}") from exc
+
+    def push_ssh_item(self, payload: dict[str, object]) -> None:
+        completed = subprocess.run(
+            ["ssh", self.ssh_target, "python3", self.ssh_script],
+            input=json.dumps(payload, ensure_ascii=False),
+            capture_output=True,
+            text=True,
+            timeout=self.ssh_timeout,
+            creationflags=SSH_NO_WINDOW,
+        )
+        if completed.returncode != 0:
+            message = (completed.stderr or completed.stdout or "ssh sync failed").strip()
+            raise RuntimeError(message)
 
 
 class NoteWindow:
@@ -751,7 +888,6 @@ class NoteWindow:
         self.text.bind("<<Modified>>", self.on_modified)
         self.text.bind("<Escape>", lambda _event: self.close())
         self.text.bind("<Control-BackSpace>", self.delete_previous_word)
-        self.text.bind("<Control-Backspace>", self.delete_previous_word)
         self.window.bind("<Control-s>", lambda _event: self.save_now())
 
         self.window.after(1, self.focus)
@@ -1046,6 +1182,8 @@ class InstantNotesApp:
         self.store = NoteStore(DB_PATH)
         self.title_worker = TitleWorker(self.store)
         self.sync_worker = SyncWorker(self.store)
+        if self.sync_worker.enabled:
+            self.store.enqueue_all_notes_for_sync()
         self.hotkeys = HotkeyThread()
         self.note_windows: dict[str, NoteWindow] = {}
         self.list_window: NoteListWindow | None = None
