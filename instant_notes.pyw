@@ -103,6 +103,10 @@ SSH_TIMEOUT_ENV = "INSTANT_NOTES_SSH_TIMEOUT"
 SSH_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 ERROR_ALREADY_EXISTS = 183
+PROCESS_PER_MONITOR_DPI_AWARE = 2
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+DPI_AWARENESS_ALREADY_SET = -2147024891
+DPI_AWARENESS_CONFIGURED = False
 
 
 class POINT(ctypes.Structure):
@@ -285,6 +289,51 @@ def set_windows_app_id() -> None:
         shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
     except Exception as exc:
         log_exception("Could not set Windows AppUserModelID", exc)
+
+
+def set_dpi_awareness() -> None:
+    global DPI_AWARENESS_CONFIGURED
+    if DPI_AWARENESS_CONFIGURED:
+        return
+
+    try:
+        setter = user32.SetProcessDpiAwarenessContext
+        setter.argtypes = [ctypes.c_void_p]
+        setter.restype = ctypes.c_bool
+        context = ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        if setter(context):
+            DPI_AWARENESS_CONFIGURED = True
+            return
+    except Exception:
+        pass
+
+    try:
+        shcore = ctypes.windll.shcore
+        setter = shcore.SetProcessDpiAwareness
+        setter.argtypes = [ctypes.c_int]
+        setter.restype = ctypes.c_long
+        result = setter(PROCESS_PER_MONITOR_DPI_AWARE)
+        if result in {0, DPI_AWARENESS_ALREADY_SET}:
+            DPI_AWARENESS_CONFIGURED = True
+            return
+    except Exception:
+        pass
+
+    try:
+        setter = user32.SetProcessDPIAware
+        setter.restype = ctypes.c_bool
+        if setter():
+            DPI_AWARENESS_CONFIGURED = True
+            return
+    except Exception as exc:
+        log_exception("Could not set DPI awareness", exc)
+
+
+def configure_tk_scaling(root: tk.Misc) -> None:
+    try:
+        root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
+    except tk.TclError as exc:
+        log_exception("Could not configure Tk scaling", exc)
 
 
 def resolve_editor_font(root: tk.Misc) -> tuple[str, int]:
@@ -1212,12 +1261,14 @@ class HotkeyThread:
 
 class InstantNotesApp:
     def __init__(self) -> None:
+        set_dpi_awareness()
         set_windows_app_id()
         self.mutex = kernel32.CreateMutexW(None, False, "Local\\InstantNotesSingleton")
         if self.mutex and kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
             raise RuntimeError("Instant Notes is already running.")
 
         self.root = tk.Tk()
+        configure_tk_scaling(self.root)
         self.root.withdraw()
         self.root.title(APP_NAME)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
@@ -1348,10 +1399,12 @@ class InstantNotesApp:
 
 
 def main() -> int:
+    set_dpi_awareness()
     try:
         app = InstantNotesApp()
     except Exception as exc:
         root = tk.Tk()
+        configure_tk_scaling(root)
         root.withdraw()
         messagebox.showerror(APP_NAME, str(exc))
         return 1
