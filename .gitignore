@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+build/
 
 # Local note storage. Do not commit private note contents.
 *.db

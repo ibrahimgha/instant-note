@@ -41,7 +41,13 @@ EDITOR_FONT_FALLBACKS = (
     "Lucida Console",
     "Courier New",
 )
-APP_DIR = Path(__file__).resolve().parent
+def runtime_app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+APP_DIR = runtime_app_dir()
 ENV_PATH = APP_DIR / ".env"
 DB_PATH = APP_DIR / "instant-notes.db"
 CONFIG_PATH = APP_DIR / "instant-notes.json"

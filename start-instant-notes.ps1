@@ -1,5 +1,11 @@
 $ErrorActionPreference = "Stop"
 
+$exe = Join-Path $PSScriptRoot "InstantNotes.exe"
+if (Test-Path $exe) {
+    Start-Process -FilePath $exe -WorkingDirectory $PSScriptRoot -WindowStyle Hidden
+    exit 0
+}
+
 $python = (Get-Command python -ErrorAction Stop).Source
 $pythonw = Join-Path (Split-Path -Parent $python) "pythonw.exe"
 
